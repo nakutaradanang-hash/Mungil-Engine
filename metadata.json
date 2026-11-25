@@ -1,0 +1,6 @@
+{
+  "name": "MungilEngine V13 — Qolbu AAA Game Studio",
+  "description": "AI-native AAA multi-agent game development studio, GDD & Style Bible generator, Three.js & Qolbu v13.0 zero-GC 3D/2D runtime optimized for Itel A70, GitHub 33-keyword connector hub, real-time build telemetry, and multi-platform export.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
