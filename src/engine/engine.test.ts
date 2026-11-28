@@ -208,7 +208,8 @@ test('18-Agent DAG resolves in topological order, tunes RuntimeConfig accurately
   const executed = runAll18AgentsPipeline(isoRacing, 24, 187);
   assert.equal(executed.agents.length, 18);
   assert.equal(executed.agents.every((a) => a.approved), true);
-  assert.equal(executed.eventBus.length, 18);
+  assert.equal(executed.eventBus.length, 19);
+  assert.ok(executed.eventBus.some((e) => e.toTopic === 'sync.tokens.locked'));
 
   const overBudget = runAll18AgentsPipeline(isoRacing, 42, 310);
   const perfAgent = overBudget.agents.find((a) => a.id === 'performance');
@@ -301,12 +302,183 @@ test('AssetAtlas packs .qbin RLE + CRC32 cleanly, GameplayKernel enforces collis
   assert.ok(healed.orchestration.autoHealedIssues.length >= 1);
   assert.ok(healed.eventBus.some((m) => m.toTopic === 'orchestrator.qa.feedback_repair'));
 
-  // Zero-deprecation Android 5+ APK pack checks
+  // Zero-deprecation Android 5+ APK pack checks (including C++/CMake NDK native VM)
   const apk = generateAndroidItelA70BuildPack(project.brief);
   assert.ok(apk.mainActivityKt.includes('WebViewAssetLoader'));
   assert.ok(apk.mainActivityKt.includes('OnBackPressedCallback'));
   assert.ok(apk.mainActivityKt.includes('onTrimMemory'));
   assert.equal(apk.mainActivityKt.includes('file:///android_asset'), false);
+  assert.ok(apk.cmakeListsTxt.includes('qolbu_native_vm'));
+  assert.ok(apk.nativeVmCpp.includes('MainActivity_nativeStepQvm'));
+  assert.ok(qbin.headerSummary.ratioPct <= 100.0);
 });
 
+test('QolbuVM v13 assembles .qasm to CRC32 bytecode, executes zero-GC ops, and SyncProtocol detects/locks token drift', async () => {
+  const {
+    QASM_PRESETS,
+    QolbuBytecodeVm,
+    assembleQolbuAsm,
+    disassembleQvmBinary,
+    verifyQvmBinary,
+  } = await import('./bytecodeVm');
+  const {
+    generatePlayableHtml5Export,
+    reconcileProjectSyncProtocol,
+  } = await import('./studioPipeline');
+
+  // Assemble & verify locomotion preset
+  const asm = assembleQolbuAsm(QASM_PRESETS[0].source);
+  assert.equal(asm.valid, true);
+  assert.equal(asm.errors.length, 0);
+  const check = verifyQvmBinary(asm.binary);
+  assert.equal(check.valid, true);
+  assert.equal(check.crc32Match, true);
+
+  const disasm = disassembleQvmBinary(asm.binary);
+  assert.equal(disasm.length, asm.instructions.length);
+
+  // Tamper bytecode -> CRC32 fails
+  const badBin = new Uint8Array(asm.binary);
+  badBin[badBin.length - 1] ^= 0x55;
+  assert.equal(verifyQvmBinary(badBin).valid, false);
+
+  // Execute locomotion kernel & 500m rebase preset in VM
+  const vm = new QolbuBytecodeVm();
+  const trace0 = vm.run(asm.binary);
+  assert.equal(trace0.halted, true);
+  assert.equal(trace0.registers[2], 41); // 5^2 + 4^2
+  assert.equal(trace0.registers[3], 1); // CHECK_MOVE valid
+  assert.deepEqual(trace0.emittedSignals, [101]);
+
+  const rebaseAsm = assembleQolbuAsm(QASM_PRESETS[1].source);
+  const trace1 = vm.run(rebaseAsm.binary);
+  assert.equal(trace1.registers[2], 1000);
+  assert.equal(trace1.registers[3], -500);
+  assert.equal(trace1.registers[4], 240);
+  assert.equal(trace1.registers[5], -140);
+  assert.deepEqual(trace1.emittedSignals, [202]);
+
+  // Centralized Sync Protocol token hash updates deterministically on edits
+  const proj = buildProjectFromPrompt('Retro 2D dungeon adventure', 'PixelVault');
+  assert.ok(proj.syncProtocol);
+  assert.equal(proj.syncProtocol.barrierLocked, true);
+  const hashBefore = proj.syncProtocol.designTokenHash;
+  const modified = reconcileProjectSyncProtocol({
+    ...proj,
+    runtimeConfig: { ...proj.runtimeConfig, shardCount: 8, projectionMode: '2.5d_isometric' },
+  });
+  assert.ok(modified.syncProtocol);
+  assert.notEqual(modified.syncProtocol.designTokenHash, hashBefore);
+  assert.equal(modified.syncProtocol.stateChecksum, proj.syncProtocol.stateChecksum);
+
+  const html = generatePlayableHtml5Export(modified);
+  assert.ok(html.includes('2.5d_isometric'));
+  assert.ok(html.includes('DASH PARRY'));
+});
+
+test('Workspace persistence saves CRC32 envelope, recovers backup on corruption, and hardens HTML5/JSON I/O', async () => {
+  const {
+    WORKSPACE_BACKUP_KEY,
+    WORKSPACE_STORAGE_KEY,
+    loadStudioWorkspaceSnapshot,
+    saveStudioWorkspaceSnapshot,
+    validateAndMigrateImportedProjectJson,
+  } = await import('./storageRecovery');
+  const { generatePlayableHtml5Export } = await import('./studioPipeline');
+
+  const store = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      store.set(k, v);
+    },
+    removeItem: (k: string) => {
+      store.delete(k);
+    },
+  };
+
+  const proj1 = buildProjectFromPrompt('Nusantara Temple Runner', 'Garuda Dawn');
+  const firstSave = saveStudioWorkspaceSnapshot(mockStorage, {
+    project: proj1,
+    builds: [],
+    tickets: [],
+    commits: [],
+    importedAssets: [],
+    projectionMode: '3d_pbr',
+  });
+  assert.equal(firstSave.ok, true);
+
+  const proj2 = buildProjectFromPrompt('Cyber Drift Racing', 'Neon Circuit');
+  saveStudioWorkspaceSnapshot(mockStorage, {
+    project: proj2,
+    builds: [],
+    tickets: [],
+    commits: [],
+    importedAssets: [],
+    projectionMode: '2.5d_isometric',
+  });
+
+  const cleanLoad = loadStudioWorkspaceSnapshot(mockStorage);
+  assert.equal(cleanLoad.recoveredFromBackup, false);
+  assert.equal(cleanLoad.snapshot?.project.brief.title, 'Neon Circuit');
+
+  // Corrupt primary save -> should recover proj1 from CRC32-verified backup slot
+  store.set(WORKSPACE_STORAGE_KEY, '{"schemaVersion":2,"checksumCrc32":"DEADBEEF","payload":{}}');
+  assert.ok(store.get(WORKSPACE_BACKUP_KEY));
+  const recovered = loadStudioWorkspaceSnapshot(mockStorage);
+  assert.equal(recovered.recoveredFromBackup, true);
+  assert.equal(recovered.snapshot?.project.brief.title, 'Garuda Dawn');
+
+  // Reject malformed or incomplete JSON project imports
+  assert.equal(validateAndMigrateImportedProjectJson('{bad json').ok, false);
+  assert.equal(validateAndMigrateImportedProjectJson('{"hello":1}').ok, false);
+
+  // Sanitize out-of-range numeric tuning and invalid hex on import
+  const validImport = validateAndMigrateImportedProjectJson(
+    JSON.stringify({
+      ...proj1,
+      runtimeConfig: { ...proj1.runtimeConfig, skyHex: 'red;position:fixed', moveSpeed: 999 },
+    })
+  );
+  assert.equal(validImport.ok, true);
+  assert.ok(/^#[0-9a-fA-F]{6}$/.test(validImport.project?.runtimeConfig.skyHex || ''));
+  assert.ok((validImport.project?.runtimeConfig.moveSpeed || 0) <= 15);
+
+  // Escape </script> injection inside playable HTML5 export
+  const xssProject = buildProjectFromPrompt('Test arena', 'Title</script><script>alert(1)</script>');
+  const exportedHtml = generatePlayableHtml5Export(xssProject);
+  assert.equal(exportedHtml.includes('</script><script>alert(1)'), false);
+  assert.ok(exportedHtml.includes('\\u003c/script\\u003e'));
+});
+
+test('Canvas2D fallback engine supports shard pickup, pillar collision, dash parry, and victory state', async () => {
+  const { createCanvas2DFallbackState, stepCanvas2DFallback } = await import('./canvas2dFallback');
+  const proj = buildProjectFromPrompt('Isometric Shrine Guardian', 'Shrine Fallback');
+  const fb = createCanvas2DFallbackState(4);
+  assert.equal(fb.shards.length, 4);
+
+  // Move player onto shard 0 and verify pickup
+  fb.playerX = fb.shards[0].x;
+  fb.playerZ = fb.shards[0].z;
+  const ev = stepCanvas2DFallback(fb, 0.033, proj.runtimeConfig, { moveX: 0, moveZ: 0, dashJustPressed: false });
+  assert.equal(ev.collectedShard, true);
+  assert.equal(fb.score, 200);
+
+  // Dash parry stuns nearby enemy
+  fb.enemies[0].x = fb.playerX + 0.5;
+  fb.enemies[0].z = fb.playerZ;
+  const parryEv = stepCanvas2DFallback(fb, 0.033, proj.runtimeConfig, { moveX: 0, moveZ: 0, dashJustPressed: true });
+  assert.equal(parryEv.parried, true);
+  assert.ok(fb.enemies[0].stunTimer > 0);
+
+  // Collect remaining shards and enter gate -> victory
+  fb.shards.forEach((s) => {
+    s.collected = true;
+  });
+  fb.playerX = fb.gateX;
+  fb.playerZ = fb.gateZ;
+  const winEv = stepCanvas2DFallback(fb, 0.033, proj.runtimeConfig, { moveX: 0, moveZ: 0, dashJustPressed: false });
+  assert.equal(winEv.outcomeChanged, 'victory');
+  assert.equal(fb.status, 'victory');
+});
 

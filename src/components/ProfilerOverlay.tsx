@@ -90,7 +90,7 @@ export const ProfilerOverlay: React.FC<ProfilerOverlayProps> = ({
     <aside
       data-testid="profiler-overlay"
       aria-label="Zero-GC Live Runtime Profiler"
-      className="pointer-events-auto absolute top-16 right-3 z-20 w-60 rounded-xl border border-slate-700 bg-slate-950/92 p-2.5 text-[11px] text-slate-100 shadow-lg"
+      className="pointer-events-auto absolute top-24 sm:top-16 right-2 sm:right-3 z-20 w-48 sm:w-60 rounded-xl border border-slate-700 bg-slate-950/92 p-2 sm:p-2.5 text-[11px] text-slate-100 shadow-lg"
     >
       <div className="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-2">
         <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-amber-400">

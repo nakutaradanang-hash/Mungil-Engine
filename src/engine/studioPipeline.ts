@@ -1,4 +1,5 @@
-import { createStudioTextureAtlasSpec, packGameBinaryBundle } from './assetAtlas';
+import { computeCrc32, createStudioTextureAtlasSpec, packGameBinaryBundle } from './assetAtlas';
+import { QASM_PRESETS, assembleQolbuAsm } from './bytecodeVm';
 import { ITEL_A70_APK_FLAGS, QOLBU_CONSTANTS } from './qolbuCore';
 import {
   createDefaultStateMachine,
@@ -14,11 +15,13 @@ import type {
   OrchestrationFeedbackTrace,
   OrchestrationStageSummary,
   ProjectionMode,
+  StateMachineSpec,
   StudioAgentNode,
   StudioBrief,
   StudioProjectState,
   StudioTriadRole,
   StyleBibleSpec,
+  SyncProtocolSnapshot,
 } from './types';
 
 export const AAA_DEPARTMENTS_18: Array<{
@@ -123,6 +126,68 @@ export class StudioMessageBus {
     });
     return this.getHistory();
   }
+}
+
+export function computeDesignTokenHash(styleBible: StyleBibleSpec, runtimeConfig: GameRuntimeConfig): string {
+  const payload = JSON.stringify({
+    palette: styleBible.palette.map((p) => p.hex),
+    projectionMode: runtimeConfig.projectionMode,
+    skyHex: runtimeConfig.skyHex,
+    groundHex: runtimeConfig.groundHex,
+    accentHex: runtimeConfig.accentHex,
+    moveSpeed: runtimeConfig.moveSpeed,
+    enemySpeed: runtimeConfig.enemySpeed,
+    shardCount: runtimeConfig.shardCount,
+    audioTempoBpm: runtimeConfig.audioTempoBpm,
+    audioScale: runtimeConfig.audioScale,
+  });
+  const crc = computeCrc32(new TextEncoder().encode(payload));
+  return `0x${crc.toString(16).toUpperCase().padStart(8, '0')}`;
+}
+
+export function computeStateChecksum(stateMachine: StateMachineSpec, gdd: GddSection): string {
+  const payload = JSON.stringify({
+    fsmName: stateMachine.name,
+    nodes: stateMachine.nodes.map((n) => `${n.id}:${n.scriptHook}`),
+    transitions: stateMachine.transitions.map((t) => `${t.from}->${t.to}:${t.trigger}:${t.guardExpr}`),
+    pillars: gdd.pillars,
+  });
+  const crc = computeCrc32(new TextEncoder().encode(payload));
+  return `0x${crc.toString(16).toUpperCase().padStart(8, '0')}`;
+}
+
+export function buildSyncProtocolSnapshot(
+  project: Pick<StudioProjectState, 'styleBible' | 'runtimeConfig' | 'stateMachine' | 'gdd'>,
+  barrierLocked: boolean,
+  driftDetected: number,
+  driftResolved: number
+): SyncProtocolSnapshot {
+  const designTokenHash = computeDesignTokenHash(project.styleBible, project.runtimeConfig);
+  const stateChecksum = computeStateChecksum(project.stateMachine, project.gdd);
+  return {
+    protocolVersion: 'QOLBU-SYNC-v13.2',
+    correlationId: `sync-${designTokenHash.slice(2, 6)}-${stateChecksum.slice(2, 6)}`,
+    designTokenHash,
+    stateChecksum,
+    barrierLocked,
+    driftEventsDetected: driftDetected,
+    driftEventsResolved: driftResolved,
+    lastSyncedAt: new Date().toISOString(),
+  };
+}
+
+export function reconcileProjectSyncProtocol(project: StudioProjectState): StudioProjectState {
+  const fsmValid = validateStateMachine(project.stateMachine).valid;
+  const prevDrift = project.syncProtocol?.driftEventsDetected ?? 0;
+  const prevResolved = project.syncProtocol?.driftEventsResolved ?? 0;
+  const syncProtocol = buildSyncProtocolSnapshot(project, fsmValid, prevDrift, prevResolved);
+  return {
+    ...project,
+    syncProtocol,
+    orchestration: project.orchestration
+      ? { ...project.orchestration, syncProtocol }
+      : undefined,
+  };
 }
 
 export function resolveAgentDagOrder(): typeof AAA_DEPARTMENTS_18 {
@@ -525,11 +590,30 @@ export function runAll18AgentsPipeline(
     },
   ];
 
+  const driftDetected = feedbackIssues.length;
+  const driftResolved = healed && finalTestsPass && finalWithinBudget ? driftDetected : 0;
+  const barrierLocked = finalTestsPass && finalWithinBudget && fsmReport.valid;
+  const syncProtocol = buildSyncProtocolSnapshot(
+    { ...project, runtimeConfig },
+    barrierLocked,
+    driftDetected,
+    driftResolved
+  );
+
+  bus.publish({
+    fromAgent: 'Central Sync Protocol',
+    toTopic: healed ? 'sync.drift.reconciled' : 'sync.tokens.locked',
+    channel: 'feedback',
+    round: healed ? 8 : 7,
+    payload: `Protocol ${syncProtocol.protocolVersion} [${syncProtocol.correlationId}] locked tokens ${syncProtocol.designTokenHash} & FSM ${syncProtocol.stateChecksum}.`,
+  });
+
   const orchestration: OrchestrationFeedbackTrace = {
-    converged: stages.every((s) => s.status === 'passed' || s.status === 'healed'),
+    converged: stages.every((s) => s.status === 'passed' || s.status === 'healed') && barrierLocked,
     roundsExecuted,
     autoHealedIssues: feedbackIssues,
     stages,
+    syncProtocol,
   };
 
   // Restore canonical display order matching AAA_DEPARTMENTS_18
@@ -552,6 +636,7 @@ export function runAll18AgentsPipeline(
     eventBus: bus.getHistory(),
     techDocsMd,
     orchestration,
+    syncProtocol,
   };
 }
 
@@ -682,18 +767,46 @@ export function buildProjectFromPrompt(
   return runAll18AgentsPipeline(initialProject, 24, 187.4);
 }
 
+function sanitizeHexToken(hex: unknown, fallback: string): string {
+  return typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex.trim()) ? hex.trim() : fallback;
+}
+
+function escapeHtmlText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function serializeJsonForInlineScript(data: unknown): string {
+  return JSON.stringify(data)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 export function generatePlayableHtml5Export(project: StudioProjectState): string {
-  const safeTitle = project.brief.title.replace(/[<>&"]/g, '');
-  const safeGenre = project.brief.genre.replace(/[<>&"]/g, '');
+  const safeTitle = escapeHtmlText(project.brief.title.trim().slice(0, 120) || 'Qolbu Arena');
+  const safeGenre = escapeHtmlText(project.brief.genre.trim().slice(0, 80) || 'Action');
   const cfg = project.runtimeConfig;
-  const serializedCfg = JSON.stringify({
-    title: safeTitle,
-    genre: safeGenre,
-    skyHex: cfg.skyHex,
-    groundHex: cfg.groundHex,
-    accentHex: cfg.accentHex,
-    hazardHex: cfg.hazardHex,
-    nominalHex: cfg.nominalHex,
+  const skyHex = sanitizeHexToken(cfg.skyHex, '#0c1220');
+  const groundHex = sanitizeHexToken(cfg.groundHex, '#1e293b');
+  const accentHex = sanitizeHexToken(cfg.accentHex, '#f59e0b');
+  const hazardHex = sanitizeHexToken(cfg.hazardHex, '#f43f5e');
+  const nominalHex = sanitizeHexToken(cfg.nominalHex, '#10b981');
+  const serializedCfg = serializeJsonForInlineScript({
+    title: project.brief.title.trim().slice(0, 120) || 'Qolbu Arena',
+    genre: project.brief.genre.trim().slice(0, 80) || 'Action',
+    projectionMode: cfg.projectionMode,
+    skyHex,
+    groundHex,
+    accentHex,
+    hazardHex,
+    nominalHex,
     moveSpeed: cfg.moveSpeed,
     enemySpeed: cfg.enemySpeed,
     shardCount: cfg.shardCount,
@@ -707,25 +820,43 @@ export function generatePlayableHtml5Export(project: StudioProjectState): string
   <title>${safeTitle} — MungilEngine V13 Playable Build</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: ${cfg.skyHex}; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; overflow: hidden; }
+    body { background: ${skyHex}; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; overflow: hidden; user-select: none; }
     .hud { position: fixed; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; pointer-events: none; font-variant-numeric: tabular-nums; }
     .pill { background: rgba(15,23,42,0.88); border: 1px solid rgba(255,255,255,0.16); padding: 6px 12px; border-radius: 8px; }
-    canvas { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; background: ${cfg.groundHex}; max-width: 96vw; max-height: 82vh; touch-action: none; }
-    .help { margin-top: 8px; font-size: 12px; opacity: 0.85; }
+    canvas { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; background: ${groundHex}; max-width: 96vw; max-height: 76vh; touch-action: none; }
+    .touch { position: fixed; bottom: 14px; left: 14px; right: 14px; display: flex; justify-content: space-between; pointer-events: none; }
+    .pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; pointer-events: auto; }
+    .btn { height: 44px; min-width: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.22); background: rgba(15,23,42,0.8); color: #f8fafc; font-weight: 700; font-size: 12px; touch-action: manipulation; }
+    .help { margin-top: 8px; font-size: 12px; opacity: 0.85; text-align: center; }
   </style>
 </head>
 <body>
   <div class="hud">
-    <div class="pill">${safeTitle} · <span id="status">PLAYING</span></div>
+    <div class="pill">${safeTitle} (${escapeHtmlText(cfg.projectionMode)}) · <span id="status">PLAYING</span></div>
     <div class="pill">HP: <span id="hp">100</span> · Shards: <span id="shards">0/${cfg.shardCount}</span> · Score: <span id="score">0</span></div>
   </div>
   <canvas id="game" width="720" height="440"></canvas>
-  <div class="help">WASD / Arrows Move · Shift / Space Dash Parry · P Pause · R Restart · Reach Gate after all shards!</div>
+  <div class="help">WASD / Arrows Move · Shift / Space Dash Parry · P Pause · R Restart</div>
+  <div class="touch">
+    <div class="pad">
+      <span></span><button class="btn" data-key="ArrowUp">W</button><span></span>
+      <button class="btn" data-key="ArrowLeft">A</button><button class="btn" data-key="ArrowDown">S</button><button class="btn" data-key="ArrowRight">D</button>
+    </div>
+    <button class="btn" data-key="ShiftLeft" style="background:${accentHex};color:#0f172a;align-self:end;">DASH PARRY</button>
+  </div>
   <script>
     const CFG = ${serializedCfg};
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d');
     const keys = {};
+    document.querySelectorAll('.btn[data-key]').forEach(btn => {
+      const k = btn.getAttribute('data-key');
+      const down = e => { e.preventDefault(); keys[k] = true; };
+      const up = e => { e.preventDefault(); keys[k] = false; };
+      btn.addEventListener('pointerdown', down);
+      btn.addEventListener('pointerup', up);
+      btn.addEventListener('pointerleave', up);
+    });
     let audioCtx = null;
     function beep(freq, dur, type) {
       try {
@@ -773,11 +904,18 @@ export function generatePlayableHtml5Export(project: StudioProjectState): string
       }
     });
     window.addEventListener('keyup', e => { keys[e.code] = false; });
+    const releaseAll = () => { Object.keys(keys).forEach(k => { keys[k] = false; }); };
+    window.addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', () => {
+      releaseAll();
+      if (!document.hidden) last = performance.now();
+    });
 
     let last = performance.now();
     function step(now) {
       const dt = Math.min(0.033, Math.max(0.016, (now - last) / 1000));
       last = now;
+      if (document.hidden) { requestAnimationFrame(step); return; }
       if (state === 'PLAYING') {
         let dx = 0, dy = 0;
         if (keys['KeyW'] || keys['ArrowUp']) dy -= 1;
@@ -833,9 +971,28 @@ export function generatePlayableHtml5Export(project: StudioProjectState): string
       ctx.fillStyle = CFG.skyHex;
       ctx.fillRect(0, 0, 720, 440);
       ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-      for (let x = 0; x < 720; x += 48) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 440); ctx.stroke(); }
+      if (CFG.projectionMode === '2.5d_isometric') {
+        for (let i = -440; i < 1160; i += 48) {
+          ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i + 440, 440); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(i, 440); ctx.lineTo(i + 440, 0); ctx.stroke();
+        }
+      } else if (CFG.projectionMode === 'pseudo_3d') {
+        for (let y = 20; y < 440; y += 28) {
+          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(720, y); ctx.stroke();
+        }
+        for (let x = -180; x <= 900; x += 90) {
+          ctx.beginPath(); ctx.moveTo(360, 0); ctx.lineTo(x, 440); ctx.stroke();
+        }
+      } else {
+        for (let x = 0; x < 720; x += 48) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 440); ctx.stroke(); }
+        if (CFG.projectionMode === '2d_flat') {
+          for (let y = 0; y < 440; y += 48) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(720, y); ctx.stroke(); }
+        }
+      }
 
       pillars.forEach(p => {
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.beginPath(); ctx.ellipse(p.x + 6, p.y + 8, p.r, p.r * 0.7, 0, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = CFG.groundHex;
         ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
       });
@@ -1113,5 +1270,89 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     </application>
 </manifest>`;
 
-  return { appId, buildGradleKts, mainActivityKt, proguardRulesPro, androidManifestXml };
+  const defaultQvm = assembleQolbuAsm(QASM_PRESETS[0].source);
+  const cmakeListsTxt = `cmake_minimum_required(VERSION 3.22.1)
+project(qolbu_native_vm LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_library(qolbu_native_vm SHARED qolbu_native_vm.cpp)
+target_compile_options(qolbu_native_vm PRIVATE
+    ${ITEL_A70_APK_FLAGS.compilerFlags}
+    -Wall -Wextra -Werror=return-type
+)
+target_link_libraries(qolbu_native_vm android log)`;
+
+  const jniPackage = appId.replace(/\./g, '_');
+  const nativeVmCpp = `#include <jni.h>
+#include <cmath>
+#include <cstdint>
+
+namespace qolbu {
+static constexpr float DT_MIN_SEC = ${QOLBU_CONSTANTS.DT_MIN_SEC}f;
+static constexpr float DT_MAX_SEC = ${QOLBU_CONSTANTS.DT_MAX_SEC}f;
+static constexpr float MAX_MOVE_DELTA_M = ${QOLBU_CONSTANTS.MAX_SPEED_MPS}f;
+static constexpr float ORIGIN_REBASE_M = ${QOLBU_CONSTANTS.ORIGIN_REBASE_M}f;
+
+inline float fast_clamp_dt(float dt) noexcept {
+    if (!std::isfinite(dt)) return DT_MAX_SEC;
+    return dt < DT_MIN_SEC ? DT_MIN_SEC : (dt > DT_MAX_SEC ? DT_MAX_SEC : dt);
+}
+
+inline int32_t exec_qvm13(const uint8_t* code, uint32_t insnCount, double* regs) noexcept {
+    int32_t pc = 0;
+    int32_t cycles = 0;
+    while (pc >= 0 && static_cast<uint32_t>(pc) < insnCount && cycles < 256) {
+        const uint8_t* insn = code + (pc * 8);
+        const uint8_t op = insn[0];
+        const uint8_t dst = insn[1] & 7;
+        const uint8_t a = insn[2] & 7;
+        const uint8_t b = insn[3] & 7;
+        const int32_t imm = static_cast<int32_t>(
+            uint32_t(insn[4]) | (uint32_t(insn[5]) << 8) | (uint32_t(insn[6]) << 16) | (uint32_t(insn[7]) << 24)
+        );
+        ++cycles;
+        switch (op) {
+            case 0x01: regs[dst] = static_cast<double>(imm); ++pc; break;
+            case 0x03: regs[dst] = regs[a] + regs[b]; ++pc; break;
+            case 0x04: regs[dst] = regs[a] - regs[b]; ++pc; break;
+            case 0x05: regs[dst] = regs[a] * regs[b]; ++pc; break;
+            case 0x06: regs[dst] = fast_clamp_dt(static_cast<float>(regs[a])); ++pc; break;
+            case 0x07: regs[dst] = (regs[a] * regs[a]) + (regs[b] * regs[b]); ++pc; break;
+            case 0x08: regs[dst] = std::abs(regs[a]) > ORIGIN_REBASE_M ? std::trunc(regs[a] / ORIGIN_REBASE_M) * ORIGIN_REBASE_M : 0.0; ++pc; break;
+            case 0x09: regs[dst] = (std::isfinite(regs[a]) && std::isfinite(regs[b]) && std::hypot(regs[a], regs[b]) <= MAX_MOVE_DELTA_M) ? 1.0 : 0.0; ++pc; break;
+            case 0x0C: pc = imm; break;
+            case 0x0D: pc = (regs[a] == 0.0) ? imm : (pc + 1); break;
+            case 0x0E: ++pc; break;
+            case 0x0F: return cycles;
+            default: ++pc; break;
+        }
+    }
+    return cycles;
+}
+} // namespace qolbu
+
+extern "C" JNIEXPORT jint JNICALL
+Java_${jniPackage}_MainActivity_nativeStepQvm(JNIEnv* env, jobject, jbyteArray bytecode) {
+    const jsize len = env->GetArrayLength(bytecode);
+    if (len < 24) return -1;
+    jbyte* ptr = env->GetByteArrayElements(bytecode, nullptr);
+    double regs[8] = {0.0};
+    const uint32_t count = static_cast<uint32_t>((len - 24) / 8);
+    const int32_t cycles = qolbu::exec_qvm13(reinterpret_cast<const uint8_t*>(ptr) + 24, count, regs);
+    env->ReleaseByteArrayElements(bytecode, ptr, JNI_ABORT);
+    return cycles;
+}
+// Precompiled Kernel CRC32: ${defaultQvm.crc32Hex}`;
+
+  return {
+    appId,
+    buildGradleKts,
+    mainActivityKt,
+    proguardRulesPro,
+    androidManifestXml,
+    cmakeListsTxt,
+    nativeVmCpp,
+  };
 }

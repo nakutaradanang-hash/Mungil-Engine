@@ -6,47 +6,63 @@ import {
   Compass,
   Download,
   FileText,
+  Lock,
   Mic,
   MicOff,
   Palette,
   Play,
   RefreshCw,
+  Sliders,
   Sparkles,
   Users,
+  Zap,
 } from 'lucide-react';
 import { downloadTextFile, sanitizeSlug } from '../engine/ioUtils';
 import { generatePlayableHtml5Export } from '../engine/studioPipeline';
-import type { ProjectionMode, StudioProjectState, StudioTriadRole } from '../engine/types';
+import type {
+  AudioScaleId,
+  GameRuntimeConfig,
+  ProjectionMode,
+  StudioProjectState,
+  StudioTriadRole,
+} from '../engine/types';
 
 interface DirectorGddPanelProps {
   project: StudioProjectState;
   projectionMode: ProjectionMode;
   onProjectionChange: (mode: ProjectionMode) => void;
+  onUpdateRuntimeConfig?: (next: GameRuntimeConfig) => void;
   onGenerateFromPrompt: (prompt: string, customTitle?: string) => Promise<void>;
   onToggleAgentApproval: (agentId: string) => void;
   onSyncRound: () => void;
   onRunAll18Agents: () => void;
   onTriggerFeedbackCycle?: () => void;
   onJumpToSandbox: () => void;
+  onInstantPlay?: () => void;
   isGenerating: boolean;
   aiNotice: string | null;
 }
 
 const PROMPT_TEMPLATES = [
   {
-    label: 'Cyber-Nusantara Action',
+    label: 'Cyber-Nusantara 3D Action',
     title: 'Garuda Obsidian',
-    prompt: 'Cyber-Nusantara 3D action platformer with parkour dash parry, floating temple shards, and Itel A70 30Hz optimization.',
+    prompt: 'Cyber-Nusantara 3D action platformer with parkour dash parry, 6 floating temple shards, and Itel A70 30Hz optimization.',
   },
   {
-    label: 'Tactical Mech Arena',
+    label: '2.5D Isometric Tactical',
     title: 'Sentinel Protocol',
-    prompt: 'Isometric 3D tactical mech skirmish with 3 AI archetypes, cover pillars, destructible shields, and 16-voice HRTF audio.',
+    prompt: 'Isometric 2.5D tactical mech skirmish with 3 AI archetypes, cover pillars, destructible shields, and 16-voice cyber audio.',
   },
   {
-    label: 'Arcade Drift Circuit',
+    label: 'Pseudo-3D Synth Drift',
     title: 'Archipelago Drift',
-    prompt: 'Stylized basalt coastal 3D arcade racing with dynamic weather, tire grip telemetry, and Android 5+ APK release.',
+    prompt: 'Pseudo-3D fake-3d coastal arcade racing with 8 speed checkpoints, dynamic mist, and Android 5+ APK release.',
+  },
+  {
+    label: 'Retro 2D Top-Down',
+    title: 'Labyrinth Keeper',
+    prompt: 'Retro 2D top-down pixel survival dungeon with 5 relic shards, stealth fog, and low-RAM mobile controls.',
   },
 ];
 
@@ -54,18 +70,21 @@ export const DirectorGddPanel: React.FC<DirectorGddPanelProps> = ({
   project,
   projectionMode,
   onProjectionChange,
+  onUpdateRuntimeConfig,
   onGenerateFromPrompt,
   onToggleAgentApproval,
   onSyncRound,
   onRunAll18Agents,
   onTriggerFeedbackCycle,
   onJumpToSandbox,
+  onInstantPlay,
   isGenerating,
   aiNotice,
 }) => {
   const [promptInput, setPromptInput] = useState(project.brief.prompt);
   const [titleInput, setTitleInput] = useState(project.brief.title);
   const [compareMode, setCompareMode] = useState(false);
+  const [customizerOpen, setCustomizerOpen] = useState(true);
   const [activeDocTab, setActiveDocTab] = useState<'agents' | 'gdd' | 'style' | 'techdocs' | 'playable'>('agents');
   const [triadFilter, setTriadFilter] = useState<'all' | StudioTriadRole>('all');
   const [recording, setRecording] = useState(false);
@@ -249,24 +268,174 @@ export const DirectorGddPanel: React.FC<DirectorGddPanelProps> = ({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-slate-500 dark:text-slate-400">Starter Templates:</span>
-          {PROMPT_TEMPLATES.map((tpl) => (
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-slate-500 dark:text-slate-400">Style &amp; Genre Presets:</span>
+            {PROMPT_TEMPLATES.map((tpl) => (
+              <button
+                key={tpl.title}
+                type="button"
+                onClick={() => {
+                  setTitleInput(tpl.title);
+                  setPromptInput(tpl.prompt);
+                }}
+                className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 px-2.5 py-1 text-slate-700 dark:text-slate-200 hover:border-amber-500"
+              >
+                {tpl.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
             <button
-              key={tpl.title}
               type="button"
-              onClick={() => {
-                setTitleInput(tpl.title);
-                setPromptInput(tpl.prompt);
-              }}
-              className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 px-2.5 py-1 text-slate-700 dark:text-slate-200 hover:border-amber-500"
+              onClick={() => setCustomizerOpen((v) => !v)}
+              className="inline-flex h-8 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-amber-500"
             >
-              {tpl.label}
+              <Sliders className="h-3.5 w-3.5 text-amber-500" />
+              {customizerOpen ? 'Hide Dev Mechanics' : 'Edit Mechanics'}
             </button>
-          ))}
-          {voiceError && <span className="text-xs text-rose-500">{voiceError}</span>}
-          {aiNotice && <span className="ml-auto text-xs text-sky-600 dark:text-sky-400">{aiNotice}</span>}
+            {onInstantPlay && (
+              <button
+                type="button"
+                data-testid="instant-play-btn"
+                onClick={onInstantPlay}
+                className="inline-flex h-8 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg bg-emerald-600 px-3.5 text-xs font-semibold text-white hover:bg-emerald-500"
+              >
+                <Zap className="h-3.5 w-3.5" />
+                1-Click Instant Play
+              </button>
+            )}
+          </div>
         </div>
+
+        {customizerOpen && onUpdateRuntimeConfig && (
+          <div
+            data-testid="dev-mechanics-customizer"
+            className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/70 p-3 text-xs"
+          >
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500 tabular-nums">
+                Move ({project.runtimeConfig.moveSpeed} m/s)
+              </span>
+              <input
+                type="range"
+                min={4}
+                max={14}
+                step={0.5}
+                value={project.runtimeConfig.moveSpeed}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, moveSpeed: Number(e.target.value) })
+                }
+                className="w-full accent-amber-500"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500 tabular-nums">
+                Enemy ({project.runtimeConfig.enemySpeed} m/s)
+              </span>
+              <input
+                type="range"
+                min={1.5}
+                max={6.5}
+                step={0.2}
+                value={project.runtimeConfig.enemySpeed}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, enemySpeed: Number(e.target.value) })
+                }
+                className="w-full accent-rose-500"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500 tabular-nums">
+                Shards ({project.runtimeConfig.shardCount})
+              </span>
+              <input
+                type="range"
+                min={3}
+                max={8}
+                step={1}
+                value={project.runtimeConfig.shardCount}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, shardCount: Number(e.target.value) })
+                }
+                className="w-full accent-emerald-500"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500 tabular-nums">
+                Tempo ({project.runtimeConfig.audioTempoBpm} BPM)
+              </span>
+              <input
+                type="range"
+                min={72}
+                max={164}
+                step={2}
+                value={project.runtimeConfig.audioTempoBpm}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, audioTempoBpm: Number(e.target.value) })
+                }
+                className="w-full accent-sky-500"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500">Audio Scale</span>
+              <select
+                value={project.runtimeConfig.audioScale}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, audioScale: e.target.value as AudioScaleId })
+                }
+                className="h-7 w-full rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-1.5 text-[11px]"
+              >
+                <option value="pentatonic">Pentatonic</option>
+                <option value="cyber_minor">Cyber Minor</option>
+                <option value="heroic_major">Heroic Major</option>
+                <option value="tension_phrygian">Phrygian</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500">Sky / Ground</span>
+              <div className="flex gap-1.5">
+                <input
+                  aria-label="Sky Color Hex"
+                  type="color"
+                  value={project.runtimeConfig.skyHex}
+                  onChange={(e) =>
+                    onUpdateRuntimeConfig({ ...project.runtimeConfig, skyHex: e.target.value.toUpperCase() })
+                  }
+                  className="h-7 w-full cursor-pointer rounded border border-slate-300 dark:border-slate-700 bg-transparent"
+                />
+                <input
+                  aria-label="Ground Color Hex"
+                  type="color"
+                  value={project.runtimeConfig.groundHex}
+                  onChange={(e) =>
+                    onUpdateRuntimeConfig({ ...project.runtimeConfig, groundHex: e.target.value.toUpperCase() })
+                  }
+                  className="h-7 w-full cursor-pointer rounded border border-slate-300 dark:border-slate-700 bg-transparent"
+                />
+              </div>
+            </label>
+            <label className="space-y-1">
+              <span className="block font-mono text-[11px] text-slate-500">Focal Accent</span>
+              <input
+                aria-label="Focal Accent Hex"
+                type="color"
+                value={project.runtimeConfig.accentHex}
+                onChange={(e) =>
+                  onUpdateRuntimeConfig({ ...project.runtimeConfig, accentHex: e.target.value.toUpperCase() })
+                }
+                className="h-7 w-full cursor-pointer rounded border border-slate-300 dark:border-slate-700 bg-transparent"
+              />
+            </label>
+          </div>
+        )}
+
+        {(voiceError || aiNotice) && (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            {voiceError && <span className="text-rose-500">{voiceError}</span>}
+            {aiNotice && <span className="ml-auto text-sky-600 dark:text-sky-400">{aiNotice}</span>}
+          </div>
+        )}
       </form>
 
       {/* Standard Prompt vs AAA Pipeline Comparison */}
@@ -388,11 +557,22 @@ export const DirectorGddPanel: React.FC<DirectorGddPanelProps> = ({
                 </span>
               </div>
             </div>
-            {orch.autoHealedIssues.length > 0 && (
-              <span className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-300">
-                Auto-Healed {orch.autoHealedIssues.length} Budget Breach
-              </span>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {(project.syncProtocol ?? orch.syncProtocol) && (
+                <span
+                  data-testid="sync-protocol-lock"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 font-mono text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 tabular-nums"
+                >
+                  <Lock className="h-3 w-3" />
+                  Tokens {(project.syncProtocol ?? orch.syncProtocol)!.designTokenHash} · FSM {(project.syncProtocol ?? orch.syncProtocol)!.stateChecksum} · {(project.syncProtocol ?? orch.syncProtocol)!.barrierLocked ? 'LOCKED' : 'DRIFT'}
+                </span>
+              )}
+              {orch.autoHealedIssues.length > 0 && (
+                <span className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-300">
+                  Auto-Healed {orch.autoHealedIssues.length} Budget Breach
+                </span>
+              )}
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">

@@ -19,6 +19,11 @@ import {
 } from 'lucide-react';
 import { qolbuAudio } from '../engine/audioSynth';
 import {
+  createCanvas2DFallbackState,
+  renderCanvas2DFallback,
+  stepCanvas2DFallback,
+} from '../engine/canvas2dFallback';
+import {
   AttackTokenPool,
   advanceTrauma,
   resolveCircleAabbCollision,
@@ -56,6 +61,7 @@ interface ThreeSandboxViewportProps {
   onTelemetryTick?: (metrics: LiveTelemetrySnapshot) => void;
   onFsmTrigger?: (trigger: string) => void;
   onCaptureScreenshot?: (dataUrl: string) => void;
+  autoStartSignal?: number;
 }
 
 interface SandboxHudState {
@@ -262,6 +268,7 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
   onTelemetryTick,
   onFsmTrigger,
   onCaptureScreenshot,
+  autoStartSignal = 0,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const internalMetricsRef = useRef<LiveTelemetrySnapshot>({
@@ -304,9 +311,13 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
   const [cameraPreset, setCameraPreset] = useState<CameraPreset3D>('third_person');
   const [localProjection, setLocalProjection] = useState<ProjectionMode>(projectionMode);
   const [qualityPreset, setQualityPreset] = useState<QualityPresetId>('itel_a70_eco');
-  const [profilerVisible, setProfilerVisible] = useState(true);
+  const [profilerVisible, setProfilerVisible] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 640 : true
+  );
   const [sceneEditorOpen, setSceneEditorOpen] = useState(false);
   const [contextLost, setContextLost] = useState(false);
+  const [fallback2DMode, setFallback2DMode] = useState(false);
+  const canvas2dRef = useRef<HTMLCanvasElement | null>(null);
   const [heroBgFailed, setHeroBgFailed] = useState(false);
   const [muted, setMuted] = useState(false);
   const [activeLayerIdx, setActiveLayerIdx] = useState(0);
@@ -388,6 +399,16 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
     document.body.dataset.state = hud.status;
   }, [hud.status]);
 
+  useEffect(() => {
+    if (autoStartSignal > 0) {
+      controlRef.current.restartQueued = true;
+      controlRef.current.status = 'playing';
+      setHud((prev) => ({ ...prev, status: 'playing' }));
+      qolbuAudio.startMusic();
+      fsmCbRef.current?.('RESUME_CLICKED');
+    }
+  }, [autoStartSignal]);
+
   const setGameStatus = (nextStatus: GameRunStatus) => {
     controlRef.current.status = nextStatus;
     setHud((prev) => ({ ...prev, status: nextStatus }));
@@ -423,14 +444,175 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
     });
   };
 
+  // Canvas2D graceful fallback loop (activated on WebGL failure, context loss, or explicit user toggle)
+  const useCanvas2D = fallback2DMode || contextLost;
+
   useEffect(() => {
+    if (!useCanvas2D) return;
+    const canvas = canvas2dRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const fbState = createCanvas2DFallbackState(runtimeCfgRef.current.shardCount);
+    fbState.status = controlRef.current.status;
+
+    const resizeCanvas2d = () => {
+      const parent = canvas.parentElement;
+      const w = Math.max(parent?.clientWidth ?? 640, 320);
+      const h = Math.max(parent?.clientHeight ?? 520, 360);
+      canvas.width = w;
+      canvas.height = h;
+    };
+    resizeCanvas2d();
+    const ro = new ResizeObserver(resizeCanvas2d);
+    if (canvas.parentElement) ro.observe(canvas.parentElement);
+
+    const onKeyDown2d = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const code = e.code;
+      controlRef.current.keys[code] = true;
+      if (controlRef.current.status === 'title' && (code === 'Enter' || code === 'Space')) {
+        e.preventDefault();
+        setGameStatus('playing');
+      } else if ((code === 'ShiftLeft' || code === 'KeyE') && controlRef.current.status === 'playing') {
+        controlRef.current.dashQueued = true;
+      } else if (code === 'KeyR' && controlRef.current.status !== 'title') {
+        triggerRestart();
+      } else if (code === 'KeyP' || code === 'Escape') {
+        if (controlRef.current.status === 'playing') setGameStatus('paused');
+        else if (controlRef.current.status === 'paused') setGameStatus('playing');
+      }
+    };
+    const onKeyUp2d = (e: KeyboardEvent) => {
+      controlRef.current.keys[e.code] = false;
+    };
+    const clearInputs2d = () => {
+      controlRef.current.keys = {};
+      controlRef.current.virtualMove = { x: 0, z: 0 };
+      controlRef.current.jumpQueued = false;
+      controlRef.current.dashQueued = false;
+    };
+    window.addEventListener('keydown', onKeyDown2d);
+    window.addEventListener('keyup', onKeyUp2d);
+    window.addEventListener('blur', clearInputs2d);
+    document.addEventListener('visibilitychange', clearInputs2d);
+
+    let raf2d = 0;
+    let last2d = performance.now();
+    let syncAcc = 0.4;
+    let cancelled = false;
+
+    const loop2d = (now: number) => {
+      if (cancelled) return;
+      const rawDt = (now - last2d) / 1000;
+      last2d = now;
+      if (document.hidden) {
+        raf2d = window.requestAnimationFrame(loop2d);
+        return;
+      }
+
+      if (controlRef.current.restartQueued) {
+        controlRef.current.restartQueued = false;
+        const fresh = createCanvas2DFallbackState(runtimeCfgRef.current.shardCount);
+        Object.assign(fbState, fresh);
+        fbState.status = controlRef.current.status;
+      } else {
+        fbState.status = controlRef.current.status;
+      }
+
+      if (controlRef.current.captureQueued) {
+        controlRef.current.captureQueued = false;
+        try {
+          captureCbRef.current?.(canvas.toDataURL('image/png'));
+        } catch {
+          // Ignore canvas capture restrictions
+        }
+      }
+
+      const keys = controlRef.current.keys;
+      let mx = controlRef.current.virtualMove.x;
+      let mz = controlRef.current.virtualMove.z;
+      if (keys['KeyW'] || keys['ArrowUp']) mz -= 1;
+      if (keys['KeyS'] || keys['ArrowDown']) mz += 1;
+      if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
+      if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+      const dashJustPressed = controlRef.current.dashQueued;
+      controlRef.current.dashQueued = false;
+
+      const stepRes = stepCanvas2DFallback(fbState, rawDt, runtimeCfgRef.current, {
+        moveX: mx,
+        moveZ: mz,
+        dashJustPressed,
+      });
+      if (stepRes.collectedShard) qolbuAudio.playSfx('pickup');
+      if (stepRes.parried) qolbuAudio.playSfx('parry');
+      if (stepRes.damaged) qolbuAudio.playSfx('hit');
+      if (stepRes.outcomeChanged === 'victory') {
+        controlRef.current.status = 'victory';
+        qolbuAudio.playSfx('victory');
+      } else if (stepRes.outcomeChanged === 'gameover') {
+        controlRef.current.status = 'gameover';
+        qolbuAudio.stopMusic();
+      }
+
+      const snap = renderCanvas2DFallback(
+        ctx,
+        canvas.width,
+        canvas.height,
+        fbState,
+        runtimeCfgRef.current,
+        controlRef.current.projectionMode
+      );
+      Object.assign(activeMetricsRef.current, snap);
+
+      syncAcc += Math.min(rawDt, 0.05);
+      if (syncAcc >= 0.3 || stepRes.outcomeChanged || stepRes.collectedShard) {
+        syncAcc = 0;
+        const collectedCount = fbState.shards.filter((s) => s.collected).length;
+        setHud((prev) => ({
+          ...prev,
+          status: fbState.status,
+          hp: Math.round(fbState.hp),
+          stamina: Math.round(fbState.stamina),
+          shards: collectedCount,
+          totalShards: fbState.shards.length,
+          score: fbState.score,
+          fps: snap.fps,
+          drawCalls: snap.drawCalls,
+          triangles: 0,
+          gateUnlocked: collectedCount >= fbState.shards.length,
+          elapsedSec: Math.round(fbState.elapsedSec),
+          aiTickCount: fbState.aiTickCount,
+        }));
+        telemetryCbRef.current?.(snap);
+      }
+
+      raf2d = window.requestAnimationFrame(loop2d);
+    };
+
+    raf2d = window.requestAnimationFrame(loop2d);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(raf2d);
+      ro.disconnect();
+      window.removeEventListener('keydown', onKeyDown2d);
+      window.removeEventListener('keyup', onKeyUp2d);
+      window.removeEventListener('blur', clearInputs2d);
+      document.removeEventListener('visibilitychange', clearInputs2d);
+    };
+  }, [useCanvas2D]);
+
+  useEffect(() => {
+    if (useCanvas2D) return;
     const container = mountRef.current;
     if (!container) return;
 
     const width = Math.max(container.clientWidth, 320);
     const height = Math.max(container.clientHeight, 360);
 
-    // Renderer & software-WebGL check
+    // Renderer & software-WebGL check with automatic Canvas2D fallback on failure
     let renderer: THREE.WebGLRenderer;
     try {
       renderer = new THREE.WebGLRenderer({
@@ -439,6 +621,7 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
         preserveDrawingBuffer: true,
       });
     } catch {
+      setFallback2DMode(true);
       return;
     }
 
@@ -1043,6 +1226,7 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
     let lastTime = performance.now();
     let hudSyncTimer = 0.5;
     let rafId = 0;
+    let timeoutId = 0;
     let disposed = false;
 
     const afterDraw = (fn: () => void) => {
@@ -1063,15 +1247,15 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
           polls += 1;
           const res = sync ? gl2.clientWaitSync(sync, 0, 0) : gl2.ALREADY_SIGNALED;
           if ((res === gl2.WAIT_FAILED || res === gl2.TIMEOUT_EXPIRED) && polls < 6) {
-            window.setTimeout(poll, 16);
+            timeoutId = window.setTimeout(poll, 16);
           } else {
             if (sync) gl2.deleteSync(sync);
-            window.setTimeout(fn, 50);
+            timeoutId = window.setTimeout(fn, 50);
           }
         };
-        window.setTimeout(poll, 50);
+        timeoutId = window.setTimeout(poll, 50);
       } else {
-        window.setTimeout(fn, 50);
+        timeoutId = window.setTimeout(fn, 50);
       }
     };
 
@@ -1081,6 +1265,13 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
 
     const tick = () => {
       if (disposed) return;
+      if (typeof document !== 'undefined' && document.hidden) {
+        lastTime = performance.now();
+        timeoutId = window.setTimeout(() => {
+          if (!disposed) afterDraw(tick);
+        }, 250);
+        return;
+      }
       const tickStart = performance.now();
       const rawDt = (tickStart - lastTime) / 1000;
       lastTime = tickStart;
@@ -1588,6 +1779,7 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
     return () => {
       disposed = true;
       window.cancelAnimationFrame(rafId);
+      window.clearTimeout(timeoutId);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onVisibilityOrBlur);
@@ -1619,7 +1811,7 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, []);
+  }, [useCanvas2D]);
 
   const currentLayer = QOLBU_12_LAYERS[activeLayerIdx] ?? QOLBU_12_LAYERS[0];
 
@@ -1728,9 +1920,25 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
 
           <button
             type="button"
+            data-testid="toggle-canvas2d-fallback"
+            onClick={() => {
+              setContextLost(false);
+              setFallback2DMode((v) => !v);
+            }}
+            className={`inline-flex h-10 sm:h-9 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg border px-3 text-xs font-medium ${
+              useCanvas2D
+                ? 'border-amber-500/60 bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                : 'border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100'
+            }`}
+          >
+            {useCanvas2D ? '2D Fallback ON' : '2D Fallback'}
+          </button>
+
+          <button
+            type="button"
             onClick={toggleMute}
             aria-label={muted ? 'Unmute Studio Audio' : 'Mute Studio Audio'}
-            className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 text-xs font-medium text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700"
+            className="inline-flex h-10 sm:h-9 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 text-xs font-medium text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700"
           >
             {muted ? <VolumeX className="h-3.5 w-3.5 text-rose-500" /> : <Volume2 className="h-3.5 w-3.5 text-emerald-500" />}
             {muted ? 'Muted' : 'Audio'}
@@ -1924,13 +2132,25 @@ export const ThreeSandboxViewport: React.FC<ThreeSandboxViewportProps> = ({
         </div>
       )}
 
-      {/* Isolated WebGL Viewport Container */}
-      <div className="relative h-[520px] sm:h-[580px] w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 shadow-xl">
-        <div ref={mountRef} className="h-full w-full" />
+      {/* Isolated WebGL / Playable Canvas2D Fallback Viewport Container */}
+      <div className="relative h-[420px] sm:h-[580px] w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 shadow-xl">
+        {!useCanvas2D ? (
+          <div ref={mountRef} className="h-full w-full" />
+        ) : (
+          <canvas
+            ref={canvas2dRef}
+            data-testid="canvas2d-fallback-surface"
+            className="block h-full w-full"
+          />
+        )}
 
         {contextLost && (
-          <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/90 text-xs text-amber-300">
-            WebGL GPU context paused — restoring scene automatically...
+          <div
+            role="status"
+            data-testid="webgl-fallback-banner"
+            className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 rounded-lg border border-amber-500/60 bg-slate-950/90 px-3 py-1 font-mono text-[11px] text-amber-300"
+          >
+            WebGL GPU context unavailable — active playable Canvas2D fallback
           </div>
         )}
 

@@ -319,11 +319,23 @@ export interface OrchestrationStageSummary {
   iteration: number;
 }
 
+export interface SyncProtocolSnapshot {
+  protocolVersion: string;
+  correlationId: string;
+  designTokenHash: string;
+  stateChecksum: string;
+  barrierLocked: boolean;
+  driftEventsDetected: number;
+  driftEventsResolved: number;
+  lastSyncedAt: string;
+}
+
 export interface OrchestrationFeedbackTrace {
   converged: boolean;
   roundsExecuted: number;
   autoHealedIssues: string[];
   stages: OrchestrationStageSummary[];
+  syncProtocol?: SyncProtocolSnapshot;
 }
 
 export interface ServerHealthStatus {
@@ -354,5 +366,6 @@ export interface StudioProjectState {
   adoptedRepos: string[];
   activeBranch: string;
   orchestration?: OrchestrationFeedbackTrace;
+  syncProtocol?: SyncProtocolSnapshot;
 }
 

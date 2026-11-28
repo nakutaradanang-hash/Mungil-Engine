@@ -5,6 +5,7 @@ import {
   BarChart3,
   Bell,
   Box,
+  Download,
   FolderGit2,
   GitBranch,
   HelpCircle,
@@ -13,6 +14,7 @@ import {
   Search,
   Sparkles,
   Sun,
+  WifiOff,
 } from 'lucide-react';
 import { CollabLiveOpsPanel } from './components/CollabLiveOpsPanel';
 import { DirectorGddPanel } from './components/DirectorGddPanel';
@@ -31,7 +33,12 @@ import {
   validateAssetPipelinePreBuild,
 } from './engine/stateMachine';
 import {
+  loadStudioWorkspaceSnapshot,
+  saveStudioWorkspaceSnapshot,
+} from './engine/storageRecovery';
+import {
   buildProjectFromPrompt,
+  reconcileProjectSyncProtocol,
   runAll18AgentsPipeline,
   runSynchronizedOrchestrationCycle,
   StudioMessageBus,
@@ -280,16 +287,33 @@ export default function App() {
     typeof window !== 'undefined' &&
     new URLSearchParams(window.location.search).get('autostart') === '1';
 
+  const [initialWorkspaceLoad] = useState(() =>
+    typeof window !== 'undefined'
+      ? loadStudioWorkspaceSnapshot(window.localStorage)
+      : { snapshot: null, recoveredFromBackup: false, migratedFromVersion: null, warning: null }
+  );
+
   const [darkMode, setDarkMode] = useState(true);
   const [activeSection, setActiveSection] = useState<StudioSectionId>(isAutoStart ? 'sandbox' : 'director');
-  const [projectionMode, setProjectionMode] = useState<ProjectionMode>('3d_pbr');
-  const [project, setProject] = useState<StudioProjectState>(() =>
-    buildProjectFromPrompt('Cyber-Nusantara 3D Sanctuary Guardian optimized for Itel A70', 'Aetherfall Sanctuary')
+  const [sandboxAutoStartNonce, setSandboxAutoStartNonce] = useState(0);
+  const [projectionMode, setProjectionMode] = useState<ProjectionMode>(
+    () => initialWorkspaceLoad.snapshot?.projectionMode ?? '3d_pbr'
+  );
+  const [project, setProject] = useState<StudioProjectState>(
+    () =>
+      initialWorkspaceLoad.snapshot?.project ??
+      buildProjectFromPrompt('Cyber-Nusantara 3D Sanctuary Guardian optimized for Itel A70', 'Aetherfall Sanctuary')
   );
   const [activeFsmState, setActiveFsmState] = useState('idle');
-  const [builds, setBuilds] = useState<BuildRecordItem[]>(INITIAL_BUILDS);
-  const [tickets, setTickets] = useState<TicketItem[]>(INITIAL_TICKETS);
-  const [commits, setCommits] = useState<CommitItem[]>(INITIAL_COMMITS);
+  const [builds, setBuilds] = useState<BuildRecordItem[]>(() =>
+    initialWorkspaceLoad.snapshot?.builds?.length ? initialWorkspaceLoad.snapshot.builds : INITIAL_BUILDS
+  );
+  const [tickets, setTickets] = useState<TicketItem[]>(() =>
+    initialWorkspaceLoad.snapshot?.tickets?.length ? initialWorkspaceLoad.snapshot.tickets : INITIAL_TICKETS
+  );
+  const [commits, setCommits] = useState<CommitItem[]>(() =>
+    initialWorkspaceLoad.snapshot?.commits?.length ? initialWorkspaceLoad.snapshot.commits : INITIAL_COMMITS
+  );
   const [liveOpsMetrics] = useState<PostLaunchMetricPoint[]>(INITIAL_LIVEOPS);
   const liveMetricsRef = useRef<LiveTelemetrySnapshot>({
     fps: 30,
@@ -304,13 +328,22 @@ export default function App() {
     runtimeMb: 21.4,
   });
   const [liveMetrics, setLiveMetrics] = useState<LiveTelemetrySnapshot>({ ...liveMetricsRef.current });
-  const [importedAssets, setImportedAssets] = useState<PreBuildAssetInput[]>([
-    { name: 'temple_guardian_unbatched.glb', kind: 'mesh', drawCalls: 18, texelDensityPxPerM: 512, tris: 14200, sizeKb: 920 },
-    { name: 'obsidian_4k_diffuse.png', kind: 'texture', drawCalls: 2, texelDensityPxPerM: 2048, sizeKb: 6400 },
-    { name: 'basalt_tile_astc.ktx2', kind: 'texture', drawCalls: 1, texelDensityPxPerM: 512, sizeKb: 240 },
-    { name: 'sanctuary_pillars_instanced.glb', kind: 'mesh', drawCalls: 5, texelDensityPxPerM: 384, tris: 4200, sizeKb: 310 },
-  ]);
+  const [importedAssets, setImportedAssets] = useState<PreBuildAssetInput[]>(() =>
+    initialWorkspaceLoad.snapshot?.importedAssets?.length
+      ? initialWorkspaceLoad.snapshot.importedAssets
+      : [
+          { name: 'temple_guardian_unbatched.glb', kind: 'mesh', drawCalls: 18, texelDensityPxPerM: 512, tris: 14200, sizeKb: 920 },
+          { name: 'obsidian_4k_diffuse.png', kind: 'texture', drawCalls: 2, texelDensityPxPerM: 2048, sizeKb: 6400 },
+          { name: 'basalt_tile_astc.ktx2', kind: 'texture', drawCalls: 1, texelDensityPxPerM: 512, sizeKb: 240 },
+          { name: 'sanctuary_pillars_instanced.glb', kind: 'mesh', drawCalls: 5, texelDensityPxPerM: 384, tris: 4200, sizeKb: 310 },
+        ]
+  );
   const [preBuildReport, setPreBuildReport] = useState<PreBuildAssetValidationReport | null>(null);
+  const [storageWarning, setStorageWarning] = useState<string | null>(initialWorkspaceLoad.warning);
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [installPromptEvent, setInstallPromptEvent] = useState<{ prompt: () => Promise<void> } | null>(null);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [aiNotice, setAiNotice] = useState<string | null>(null);
@@ -340,6 +373,39 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    const handleBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setInstallPromptEvent(e as unknown as { prompt: () => Promise<void> });
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const saveTimer = window.setTimeout(() => {
+      saveStudioWorkspaceSnapshot(window.localStorage, {
+        project,
+        builds,
+        tickets,
+        commits,
+        importedAssets,
+        projectionMode,
+      });
+    }, 350);
+    return () => window.clearTimeout(saveTimer);
+  }, [project, builds, tickets, commits, importedAssets, projectionMode]);
 
   useEffect(() => {
     let active = true;
@@ -815,7 +881,7 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
       {/* Sticky Top Header (Compact <=12% height on mobile) */}
       <header className="sticky top-0 z-40 border-b border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-950/95 backdrop-blur-sm">
-        <div className="mx-auto max-w-[1440px] px-4 py-2.5 flex items-center justify-between gap-3">
+        <div className="mx-auto max-w-[1440px] px-4 py-2 flex items-center justify-between gap-2">
           <div className="flex items-center gap-3 min-w-0">
             <div className="h-9 w-9 shrink-0 rounded-xl bg-amber-500 flex items-center justify-center text-slate-950 font-display font-bold text-sm">
               M13
@@ -832,7 +898,35 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            {!isOnline && (
+              <div
+                data-testid="offline-status-badge"
+                className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-xl border border-amber-500/50 bg-amber-500/15 px-2.5 font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-300"
+              >
+                <WifiOff className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Offline Mode</span>
+              </div>
+            )}
+
+            {installPromptEvent && (
+              <button
+                type="button"
+                data-testid="pwa-install-btn"
+                onClick={async () => {
+                  try {
+                    await installPromptEvent.prompt();
+                  } finally {
+                    setInstallPromptEvent(null);
+                  }
+                }}
+                className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-xl bg-amber-500 px-3 text-xs font-semibold text-slate-950 hover:bg-amber-400"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Install App</span>
+              </button>
+            )}
+
             <div
               data-testid="header-server-health"
               className="hidden md:inline-flex h-9 items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 px-2.5 font-mono text-[11px] tabular-nums text-slate-600 dark:text-slate-300"
@@ -848,7 +942,8 @@ export default function App() {
             <button
               type="button"
               onClick={() => setQuickSearchOpen(true)}
-              className="inline-flex h-9 items-center gap-2 whitespace-nowrap shrink-0 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-3 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-amber-500"
+              aria-label="Open Quick Search"
+              className="inline-flex h-9 items-center gap-2 whitespace-nowrap shrink-0 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 sm:px-3 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-amber-500"
             >
               <Search className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Quick Search</span>
@@ -891,7 +986,7 @@ export default function App() {
         </div>
 
         {/* Navigation Strip */}
-        <nav className="mx-auto max-w-[1440px] px-4 pb-2.5 flex items-center gap-1.5 overflow-x-auto">
+        <nav className="mx-auto max-w-[1440px] px-4 pb-2 flex items-center gap-1.5 overflow-x-auto">
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             const active = activeSection === item.id;
@@ -900,7 +995,7 @@ export default function App() {
                 key={item.id}
                 type="button"
                 onClick={() => setActiveSection(item.id)}
-                className={`inline-flex h-8 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg px-3 text-xs font-semibold transition-colors ${
+                className={`inline-flex h-10 sm:h-8 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg px-3 text-xs font-semibold transition-colors ${
                   active
                     ? 'bg-amber-500 text-slate-950'
                     : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800/80'
@@ -917,6 +1012,22 @@ export default function App() {
 
       {/* Main Studio Workspace */}
       <main className="mx-auto max-w-[1440px] px-4 py-6">
+        {storageWarning && (
+          <div
+            role="status"
+            data-testid="workspace-recovery-alert"
+            className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber-500/50 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-800 dark:text-amber-200"
+          >
+            <span>{storageWarning}</span>
+            <button
+              type="button"
+              onClick={() => setStorageWarning(null)}
+              className="rounded-lg border border-amber-500/40 px-2.5 py-1 text-[11px] font-semibold hover:bg-amber-500/20"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <StudioErrorBoundary
           key={activeSection}
           preBuildReport={activeSection === 'sandbox' ? null : preBuildReport}
@@ -933,10 +1044,16 @@ export default function App() {
               projectionMode={projectionMode}
               onProjectionChange={(mode) => {
                 setProjectionMode(mode);
-                setProject((prev) => ({
-                  ...prev,
-                  runtimeConfig: { ...prev.runtimeConfig, projectionMode: mode },
-                }));
+                setProject((prev) =>
+                  reconcileProjectSyncProtocol({
+                    ...prev,
+                    runtimeConfig: { ...prev.runtimeConfig, projectionMode: mode },
+                  })
+                );
+              }}
+              onUpdateRuntimeConfig={(nextCfg) => {
+                setProjectionMode(nextCfg.projectionMode);
+                setProject((prev) => reconcileProjectSyncProtocol({ ...prev, runtimeConfig: nextCfg }));
               }}
               onGenerateFromPrompt={handleGenerateFromPrompt}
               onToggleAgentApproval={(agentId) =>
@@ -948,14 +1065,20 @@ export default function App() {
               onSyncRound={() => {
                 const bus = new StudioMessageBus();
                 const loopMsgs = bus.runTriadValidationLoop(project.brief, liveMetrics.drawCalls, liveMetrics.memoryMb);
-                setProject((prev) => ({
-                  ...prev,
-                  eventBus: [...loopMsgs, ...prev.eventBus].slice(0, 24),
-                }));
+                setProject((prev) =>
+                  reconcileProjectSyncProtocol({
+                    ...prev,
+                    eventBus: [...loopMsgs, ...prev.eventBus].slice(0, 24),
+                  })
+                );
               }}
               onRunAll18Agents={handleRunAll18Agents}
               onTriggerFeedbackCycle={handleTriggerFeedbackCycle}
               onJumpToSandbox={() => setActiveSection('sandbox')}
+              onInstantPlay={() => {
+                setSandboxAutoStartNonce((n) => n + 1);
+                setActiveSection('sandbox');
+              }}
               isGenerating={isGenerating}
               aiNotice={aiNotice}
             />
@@ -965,28 +1088,33 @@ export default function App() {
             <ThreeSandboxViewport
               brief={project.brief}
               runtimeConfig={project.runtimeConfig}
+              autoStartSignal={sandboxAutoStartNonce}
               onUpdateRuntimeConfig={(nextCfg: GameRuntimeConfig) =>
-                setProject((prev) => ({ ...prev, runtimeConfig: nextCfg }))
+                setProject((prev) => reconcileProjectSyncProtocol({ ...prev, runtimeConfig: nextCfg }))
               }
               onResetRuntimeConfig={() =>
-                setProject((prev) => ({
-                  ...prev,
-                  runtimeConfig: synthesizeRuntimeConfig(
-                    prev.brief.prompt,
-                    prev.brief,
-                    prev.styleBible,
-                    prev.adoptedRepos
-                  ),
-                }))
+                setProject((prev) =>
+                  reconcileProjectSyncProtocol({
+                    ...prev,
+                    runtimeConfig: synthesizeRuntimeConfig(
+                      prev.brief.prompt,
+                      prev.brief,
+                      prev.styleBible,
+                      prev.adoptedRepos
+                    ),
+                  })
+                )
               }
               metricsRef={liveMetricsRef}
               projectionMode={projectionMode}
               onProjectionChange={(mode) => {
                 setProjectionMode(mode);
-                setProject((prev) => ({
-                  ...prev,
-                  runtimeConfig: { ...prev.runtimeConfig, projectionMode: mode },
-                }));
+                setProject((prev) =>
+                  reconcileProjectSyncProtocol({
+                    ...prev,
+                    runtimeConfig: { ...prev.runtimeConfig, projectionMode: mode },
+                  })
+                );
               }}
               onTelemetryTick={(m) => setLiveMetrics(m)}
               onFsmTrigger={handleFsmTrigger}
@@ -1029,8 +1157,21 @@ export default function App() {
                   }
                 }
               }}
-              onUpdateTicketStatus={(id, status) => {
+              onUpdateTicketStatus={async (id, status) => {
                 setTickets((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)));
+                const numericId = Number(id);
+                if (user && Number.isInteger(numericId) && numericId > 0) {
+                  try {
+                    const token = await user.getIdToken();
+                    await fetch(`/api/db/tickets/${numericId}`, {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                      body: JSON.stringify({ status }),
+                    });
+                  } catch {
+                    // Local optimistic state preserved
+                  }
+                }
               }}
               drawCalls={liveMetrics.drawCalls}
               memoryMb={liveMetrics.memoryMb}

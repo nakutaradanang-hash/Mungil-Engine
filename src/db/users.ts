@@ -1,4 +1,4 @@
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { db } from './index.ts';
 import { builds, commits, postLaunchMetrics, projects, tickets, users } from './schema.ts';
 
@@ -70,7 +70,7 @@ export async function upsertProjectRecord(
           activeBranch: payload.activeBranch,
           updatedAt: new Date(),
         })
-        .where(eq(projects.id, payload.id))
+        .where(and(eq(projects.id, payload.id), eq(projects.userId, userId)))
         .returning();
       if (updated[0]) return updated[0];
     }
@@ -152,9 +152,31 @@ export async function insertTicketRecord(payload: {
   }
 }
 
-export async function updateTicketStatusRecord(ticketId: number, status: string) {
+export async function getTicketWithOwner(ticketId: number) {
   try {
-    const [row] = await db.update(tickets).set({ status }).where(eq(tickets.id, ticketId)).returning();
+    const rows = await db
+      .select({
+        ticketId: tickets.id,
+        projectId: tickets.projectId,
+        userId: projects.userId,
+      })
+      .from(tickets)
+      .innerJoin(projects, eq(tickets.projectId, projects.id))
+      .where(eq(tickets.id, ticketId));
+    return rows[0] ?? null;
+  } catch (error) {
+    console.error('Failed to look up ticket owner:', error);
+    throw new Error('Failed to verify ticket ownership.', { cause: error });
+  }
+}
+
+export async function updateTicketStatusRecord(ticketId: number, projectId: number, status: string) {
+  try {
+    const [row] = await db
+      .update(tickets)
+      .set({ status })
+      .where(and(eq(tickets.id, ticketId), eq(tickets.projectId, projectId)))
+      .returning();
     return row;
   } catch (error) {
     console.error('Failed to update ticket:', error);

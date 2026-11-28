@@ -10,6 +10,7 @@ import { createServer as createViteServer } from 'vite';
 import {
   getOrCreateUser,
   getProjectDetails,
+  getTicketWithOwner,
   insertBuildRecord,
   insertCommitRecord,
   insertTicketRecord,
@@ -18,6 +19,13 @@ import {
   upsertProjectRecord,
 } from './src/db/users.ts';
 import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+
+const ALLOWED_TICKET_STATUSES = new Set(['open', 'in_progress', 'resolved']);
+const ALLOWED_TICKET_PRIORITIES = new Set(['critical', 'high', 'medium', 'low']);
+const ALLOWED_BUILD_STATUSES = new Set(['passed', 'failed', 'warning']);
+const ALLOWED_TTS_VOICES = new Set(['Kore', 'Aoede', 'Puck', 'Charon', 'Fenrir']);
+const clampStr = (val: unknown, maxLen: number, fallback = ''): string =>
+  typeof val === 'string' ? val.trim().slice(0, maxLen) : fallback;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -69,8 +77,8 @@ app.get('/api/health', (_req, res) => {
 // ─── AI Blueprint Generator (Gemini 4 Hydrogen + ThinkingLevel.HIGH + Schema) ───
 app.post('/api/ai/generate-blueprint', async (req, res) => {
   const ai = getAiClient();
-  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
-  const customTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  const prompt = clampStr(req.body?.prompt, 2400);
+  const customTitle = clampStr(req.body?.title, 120);
   if (!prompt) {
     return res.status(400).json({ error: 'Prompt is required.' });
   }
@@ -175,12 +183,12 @@ Respond strictly in JSON matching the schema.`,
 // ─── AI Studio Director Chat (Gemini 4 Hydrogen / 3.1 Flash Lite + Google Search) ───
 app.post('/api/ai/chat', async (req, res) => {
   const ai = getAiClient();
-  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
-  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  const message = clampStr(req.body?.message, 4000);
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-10) : [];
   const lowLatency = Boolean(req.body?.lowLatency);
   const useSearch = Boolean(req.body?.useSearch);
   const useThinking = req.body?.useThinking !== false;
-  const projectContext = typeof req.body?.projectContext === 'string' ? req.body.projectContext : '';
+  const projectContext = clampStr(req.body?.projectContext, 2000);
 
   if (!message) {
     return res.status(400).json({ error: 'Message is required.' });
@@ -236,8 +244,9 @@ app.post('/api/ai/chat', async (req, res) => {
 // ─── Text-to-Speech Voiceover (Gemini 3.8 Flash Lite / Flash TTS -> WAV) ───
 app.post('/api/ai/tts', async (req, res) => {
   const ai = getAiClient();
-  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-  const voiceName = typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Kore';
+  const text = clampStr(req.body?.text, 1500);
+  const rawVoice = clampStr(req.body?.voiceName, 32, 'Kore');
+  const voiceName = ALLOWED_TTS_VOICES.has(rawVoice) ? rawVoice : 'Kore';
   const highQuality = Boolean(req.body?.highQuality);
 
   if (!text) return res.status(400).json({ error: 'Text is required for speech synthesis.' });
@@ -418,18 +427,20 @@ app.post('/api/db/builds', requireAuth, async (req: AuthRequest, res) => {
     if (!details || details.project.userId !== dbUser.id) {
       return res.status(403).json({ error: 'Project not found or access denied.' });
     }
+    const rawStatus = clampStr(req.body?.status, 24, 'passed');
+    const safeBuildStatus = ALLOWED_BUILD_STATUSES.has(rawStatus) ? rawStatus : 'passed';
     const row = await insertBuildRecord({
       projectId,
-      versionTag: String(req.body.versionTag || 'v13.0.1'),
-      status: String(req.body.status || 'passed'),
-      targetPlatform: String(req.body.targetPlatform || 'Itel A70 Android APK'),
-      cpuMs: Number(req.body.cpuMs || 14.2),
-      gpuMs: Number(req.body.gpuMs || 11.4),
-      drawCalls: Number(req.body.drawCalls || 24),
-      memoryMb: Number(req.body.memoryMb || 187),
-      fpsAvg: Number(req.body.fpsAvg || 30),
-      errorSummary: String(req.body.errorSummary || ''),
-      logText: String(req.body.logText || 'Build verified cleanly.'),
+      versionTag: clampStr(req.body?.versionTag, 32, 'v13.0.1'),
+      status: safeBuildStatus,
+      targetPlatform: clampStr(req.body?.targetPlatform, 80, 'Itel A70 Android APK'),
+      cpuMs: Number.isFinite(Number(req.body?.cpuMs)) ? Math.max(0, Math.min(1000, Number(req.body.cpuMs))) : 14.2,
+      gpuMs: Number.isFinite(Number(req.body?.gpuMs)) ? Math.max(0, Math.min(1000, Number(req.body.gpuMs))) : 11.4,
+      drawCalls: Number.isFinite(Number(req.body?.drawCalls)) ? Math.max(0, Math.min(10000, Math.round(Number(req.body.drawCalls)))) : 24,
+      memoryMb: Number.isFinite(Number(req.body?.memoryMb)) ? Math.max(0, Math.min(65536, Number(req.body.memoryMb))) : 187,
+      fpsAvg: Number.isFinite(Number(req.body?.fpsAvg)) ? Math.max(1, Math.min(240, Number(req.body.fpsAvg))) : 30,
+      errorSummary: clampStr(req.body?.errorSummary, 400),
+      logText: clampStr(req.body?.logText, 4000, 'Build verified cleanly.'),
     });
     return res.json({ build: row });
   } catch (error) {
@@ -448,13 +459,15 @@ app.post('/api/db/tickets', requireAuth, async (req: AuthRequest, res) => {
     if (!details || details.project.userId !== dbUser.id) {
       return res.status(403).json({ error: 'Project not found or access denied.' });
     }
+    const rawPriority = clampStr(req.body?.priority, 16, 'medium');
+    const rawStatus = clampStr(req.body?.status, 24, 'open');
     const row = await insertTicketRecord({
       projectId,
-      title: String(req.body.title || 'Untitled Ticket'),
-      department: String(req.body.department || 'QA'),
-      priority: String(req.body.priority || 'medium'),
-      status: String(req.body.status || 'open'),
-      assignee: String(req.body.assignee || 'QA & Automation Lead'),
+      title: clampStr(req.body?.title, 200, 'Untitled Ticket'),
+      department: clampStr(req.body?.department, 80, 'QA'),
+      priority: ALLOWED_TICKET_PRIORITIES.has(rawPriority) ? rawPriority : 'medium',
+      status: ALLOWED_TICKET_STATUSES.has(rawStatus) ? rawStatus : 'open',
+      assignee: clampStr(req.body?.assignee, 80, 'QA & Automation Lead'),
     });
     return res.json({ ticket: row });
   } catch (error) {
@@ -465,12 +478,28 @@ app.post('/api/db/tickets', requireAuth, async (req: AuthRequest, res) => {
 
 app.patch('/api/db/tickets/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
+    const uid = req.user?.uid;
+    if (!uid) return res.status(401).json({ error: 'Invalid user token.' });
+    const dbUser = await getOrCreateUser(uid, req.user?.email || 'studio@mungil.local', req.user?.name);
+
     const ticketId = Number(req.params.id);
-    const status = String(req.body?.status || 'open');
     if (!Number.isInteger(ticketId) || ticketId <= 0) {
       return res.status(400).json({ error: 'Invalid ticket ID.' });
     }
-    const row = await updateTicketStatusRecord(ticketId, status);
+    const status = clampStr(req.body?.status, 24);
+    if (!ALLOWED_TICKET_STATUSES.has(status)) {
+      return res.status(400).json({ error: 'Invalid ticket status. Expected open, in_progress, or resolved.' });
+    }
+
+    const ownerRecord = await getTicketWithOwner(ticketId);
+    if (!ownerRecord) {
+      return res.status(404).json({ error: 'Ticket not found.' });
+    }
+    if (ownerRecord.userId !== dbUser.id) {
+      return res.status(403).json({ error: 'Access denied for this ticket.' });
+    }
+
+    const row = await updateTicketStatusRecord(ticketId, ownerRecord.projectId, status);
     return res.json({ ticket: row });
   } catch (error) {
     console.error('PATCH /api/db/tickets/:id failed:', error);

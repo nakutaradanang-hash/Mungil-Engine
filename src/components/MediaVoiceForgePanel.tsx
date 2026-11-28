@@ -14,6 +14,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { qolbuAudio } from '../engine/audioSynth';
+import { downloadTextFile, sanitizeSlug } from '../engine/ioUtils';
 import { generateProcedural3DMeshExport } from '../engine/studioPipeline';
 import type { StudioProjectState } from '../engine/types';
 
@@ -301,16 +302,6 @@ export const MediaVoiceForgePanel: React.FC<MediaVoiceForgePanelProps> = ({ proj
     reader.readAsDataURL(file);
   };
 
-  const downloadTextFile = (content: string, filename: string, mime: string) => {
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
@@ -580,7 +571,7 @@ export const MediaVoiceForgePanel: React.FC<MediaVoiceForgePanelProps> = ({ proj
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={() => downloadTextFile(meshData.objText, `${meshData.name}-${meshKind}.obj`, 'text/plain')}
+              onClick={() => downloadTextFile(meshData.objText, `${sanitizeSlug(meshData.name)}-${meshKind}.obj`, 'text/plain')}
               className="flex-1 inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <Download className="h-3.5 w-3.5" />
@@ -588,7 +579,7 @@ export const MediaVoiceForgePanel: React.FC<MediaVoiceForgePanelProps> = ({ proj
             </button>
             <button
               type="button"
-              onClick={() => downloadTextFile(meshData.gltfJson, `${meshData.name}-${meshKind}.gltf`, 'model/gltf+json')}
+              onClick={() => downloadTextFile(meshData.gltfJson, `${sanitizeSlug(meshData.name)}-${meshKind}.gltf`, 'model/gltf+json')}
               className="flex-1 inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-xs font-semibold text-white dark:text-slate-900"
             >
               <Download className="h-3.5 w-3.5" />

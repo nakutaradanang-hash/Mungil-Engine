@@ -1,4 +1,5 @@
 import { jsPDF } from 'jspdf';
+import { sanitizeSlug } from './ioUtils';
 import type {
   AutomatedTestCaseResult,
   BuildRecordItem,
@@ -63,6 +64,6 @@ export function exportBuildAnalysisPdf(
     );
   });
 
-  const slug = project.brief.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 28) || 'mungil-build';
+  const slug = sanitizeSlug(project.brief.title, 'mungil-build');
   doc.save(`${slug}-build-analysis.pdf`);
 }

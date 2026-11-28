@@ -1,13 +1,23 @@
 import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  Binary,
   CheckCircle2,
+  Cpu,
+  Download,
   GitBranch,
   Play,
   Plus,
   ShieldCheck,
   Wrench,
 } from 'lucide-react';
+import {
+  QASM_PRESETS,
+  QolbuBytecodeVm,
+  assembleQolbuAsm,
+  disassembleQvmBinary,
+} from '../engine/bytecodeVm';
+import { downloadBinaryFile } from '../engine/ioUtils';
 import { runQolbu8StageAudit } from '../engine/qolbuCore';
 import {
   runAssetCompilationGuard,
@@ -51,6 +61,19 @@ export const StateMachineQaPanel: React.FC<StateMachineQaPanelProps> = ({
   const [ticketDept, setTicketDept] = useState('Gameplay Engineering');
   const [ticketPriority, setTicketPriority] = useState<TicketItem['priority']>('high');
   const [testRunNonce, setTestRunNonce] = useState(0);
+  const [selectedPresetId, setSelectedPresetId] = useState(QASM_PRESETS[0].id);
+  const [qasmSource, setQasmSource] = useState(QASM_PRESETS[0].source);
+
+  const assembledQvm = useMemo(() => assembleQolbuAsm(qasmSource), [qasmSource]);
+  const disassembledQvm = useMemo(
+    () => (assembledQvm.valid ? disassembleQvmBinary(assembledQvm.binary) : []),
+    [assembledQvm]
+  );
+  const qvmTrace = useMemo(() => {
+    if (!assembledQvm.valid) return null;
+    const vm = new QolbuBytecodeVm();
+    return vm.run(assembledQvm.binary, 128);
+  }, [assembledQvm]);
 
   const validation = useMemo(() => validateStateMachine(stateMachine), [stateMachine]);
 
@@ -352,6 +375,131 @@ export const StateMachineQaPanel: React.FC<StateMachineQaPanelProps> = ({
                 </span>
               </div>
             ))}
+          </div>
+        </div>
+      </div>
+
+      {/* QolbuVM v13 Zero-GC Binary Bytecode & Assembly Kernel */}
+      <div
+        data-testid="qolbu-bytecode-vm-card"
+        className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 p-5 space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="font-mono text-xs uppercase text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+              <Binary className="h-3.5 w-3.5" />
+              QVM13 Binary Bytecode &amp; Assembly Compiler
+            </p>
+            <h3 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+              Zero-GC Deterministic Low-Level Gameplay &amp; Physics VM
+            </h3>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {QASM_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => {
+                  setSelectedPresetId(preset.id);
+                  setQasmSource(preset.source);
+                }}
+                className={`h-8 rounded-lg px-2.5 text-xs font-semibold ${
+                  selectedPresetId === preset.id
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                {preset.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              disabled={!assembledQvm.valid}
+              onClick={() => downloadBinaryFile(assembledQvm.binary, `${selectedPresetId}.qvm`)}
+              className="inline-flex h-8 items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg bg-slate-900 dark:bg-slate-100 px-3 text-xs font-semibold text-white dark:text-slate-900 disabled:opacity-50"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export .qvm ({assembledQvm.binary.byteLength}B)
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+          <div className="lg:col-span-6 space-y-2">
+            <label className="block text-xs font-mono text-slate-500 dark:text-slate-400">
+              Qolbu Assembly (.qasm)
+            </label>
+            <textarea
+              aria-label="Qolbu Assembly Source"
+              rows={9}
+              value={qasmSource}
+              onChange={(e) => setQasmSource(e.target.value)}
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-3 font-mono text-xs leading-relaxed text-slate-900 dark:text-slate-100 focus:border-amber-500 focus:outline-none"
+            />
+            {assembledQvm.errors.length > 0 && (
+              <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 font-mono text-xs text-rose-500">
+                {assembledQvm.errors[0]}
+              </div>
+            )}
+          </div>
+
+          <div className="lg:col-span-6 space-y-3">
+            <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5">
+                <div className="text-slate-500">CRC32 Checksum</div>
+                <div className="font-bold text-emerald-600 dark:text-emerald-400 mt-0.5 tabular-nums">
+                  {assembledQvm.crc32Hex}
+                </div>
+              </div>
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5">
+                <div className="text-slate-500">Bytecode Size</div>
+                <div className="font-bold text-slate-900 dark:text-white mt-0.5 tabular-nums">
+                  {assembledQvm.binary.byteLength} B ({assembledQvm.instructions.length} ops)
+                </div>
+              </div>
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5">
+                <div className="text-slate-500">VM Trace</div>
+                <div className="font-bold text-amber-600 dark:text-amber-400 mt-0.5 tabular-nums">
+                  {qvmTrace ? `${qvmTrace.cycles} cycles · ${qvmTrace.halted ? 'HALT' : 'RUN'}` : 'ERROR'}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 space-y-2 text-xs font-mono">
+              <div className="flex items-center justify-between text-slate-500">
+                <span className="flex items-center gap-1.5">
+                  <Cpu className="h-3.5 w-3.5 text-amber-500" />
+                  Float64 Registers (R0..R7)
+                </span>
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  FSM Signals: {qvmTrace?.emittedSignals.join(', ') || 'None'}
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-1.5 tabular-nums">
+                {(qvmTrace?.registers ?? Array(8).fill(0)).map((val, rIdx) => (
+                  <div
+                    key={rIdx}
+                    className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1"
+                  >
+                    <span className="text-slate-400">R{rIdx}:</span>{' '}
+                    <span className="font-bold text-slate-900 dark:text-white">
+                      {Number.isInteger(val) ? val : val.toFixed(3)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="pt-1 text-[11px] text-slate-500 break-all">
+                Hex Header + Code: {assembledQvm.opHex}
+              </div>
+              <div className="max-h-24 overflow-y-auto text-[11px] text-slate-600 dark:text-slate-300 space-y-0.5 pt-1 border-t border-slate-200 dark:border-slate-800">
+                {disassembledQvm.map((d) => (
+                  <div key={d.pc}>
+                    [{String(d.pc).padStart(2, '0')}] {d.mnemonic.padEnd(10, ' ')} dst=R{d.dst} a=R{d.a} b=R{d.b} imm={d.imm}
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       </div>

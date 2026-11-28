@@ -185,6 +185,7 @@ export function packGameBinaryBundle(project: StudioProjectState): {
     engine: 'MungilEngine-V13-Qolbu',
     title: project.brief.title,
     genre: project.brief.genre,
+    syncTokenHash: project.syncProtocol?.designTokenHash ?? '0xSYNC',
     runtimeConfig: project.runtimeConfig,
     atlas,
     fsm: {
@@ -202,23 +203,26 @@ export function packGameBinaryBundle(project: StudioProjectState): {
 
   const rawBytes = new TextEncoder().encode(manifest);
   const compressed = compressBinaryRle(rawBytes);
+  const useRle = compressed.length < rawBytes.length;
+  const payloadBytes = useRle ? compressed : rawBytes;
+  const flags = useRle ? 1 : 0;
   const crc32 = computeCrc32(rawBytes);
 
   const headerSize = 28;
-  const bundle = new Uint8Array(headerSize + compressed.length);
+  const bundle = new Uint8Array(headerSize + payloadBytes.length);
   const view = new DataView(bundle.buffer);
 
   for (let i = 0; i < 8; i++) {
     bundle[i] = QBIN_MAGIC.charCodeAt(i);
   }
   view.setUint16(8, 13, true);
-  view.setUint16(10, 1, true); // Bit 0: RLE compressed
+  view.setUint16(10, flags, true); // Bit 0: RLE compressed when smaller
   view.setUint16(12, 128, true);
   view.setUint16(14, 64, true);
   view.setUint32(16, rawBytes.length, true);
-  view.setUint32(20, compressed.length, true);
+  view.setUint32(20, payloadBytes.length, true);
   view.setUint32(24, crc32, true);
-  bundle.set(compressed, headerSize);
+  bundle.set(payloadBytes, headerSize);
 
   return {
     bytes: bundle,
@@ -226,8 +230,8 @@ export function packGameBinaryBundle(project: StudioProjectState): {
       magic: 'QBIN13',
       version: 13,
       uncompressedBytes: rawBytes.length,
-      compressedBytes: compressed.length,
-      ratioPct: Number(((compressed.length / Math.max(1, rawBytes.length)) * 100).toFixed(1)),
+      compressedBytes: payloadBytes.length,
+      ratioPct: Number(((payloadBytes.length / Math.max(1, rawBytes.length)) * 100).toFixed(1)),
       crc32Hex: `0x${crc32.toString(16).toUpperCase().padStart(8, '0')}`,
     },
   };
@@ -250,12 +254,13 @@ export function verifyQbinBundle(bundle: Uint8Array): {
 
   const view = new DataView(bundle.buffer, bundle.byteOffset, bundle.byteLength);
   const version = view.getUint16(8, true);
+  const flags = view.getUint16(10, true);
   const uncompressedSize = view.getUint32(16, true);
-  const compressedSize = view.getUint32(20, true);
+  const storedSize = view.getUint32(20, true);
   const expectedCrc = view.getUint32(24, true);
 
-  const payload = bundle.subarray(28, 28 + compressedSize);
-  const restored = decompressBinaryRle(payload, uncompressedSize);
+  const payload = bundle.subarray(28, 28 + storedSize);
+  const restored = (flags & 1) !== 0 ? decompressBinaryRle(payload, uncompressedSize) : payload;
   const actualCrc = computeCrc32(restored);
   const crc32Match = actualCrc === expectedCrc;
   const manifestJson = new TextDecoder().decode(restored);

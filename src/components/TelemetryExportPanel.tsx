@@ -20,10 +20,11 @@ import {
   Upload,
 } from 'lucide-react';
 import { packGameBinaryBundle } from '../engine/assetAtlas';
-import { downloadBinaryFile, downloadTextFile, safeJsonParse, sanitizeSlug } from '../engine/ioUtils';
+import { downloadBinaryFile, downloadTextFile, sanitizeSlug } from '../engine/ioUtils';
 import { exportBuildAnalysisPdf } from '../engine/pdfExport';
 import { QOLBU_CONSTANTS, runQolbu8StageAudit } from '../engine/qolbuCore';
 import { runAutomatedLogicTests } from '../engine/stateMachine';
+import { validateAndMigrateImportedProjectJson } from '../engine/storageRecovery';
 import { generateAndroidItelA70BuildPack, generatePlayableHtml5Export } from '../engine/studioPipeline';
 import type {
   AutomatedTestCaseResult,
@@ -678,7 +679,10 @@ export const TelemetryExportPanel: React.FC<TelemetryExportPanelProps> = ({
 
           <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 font-mono text-[11px] text-slate-700 dark:text-slate-300 space-y-1">
             <div>App ID: {apkPack.appId}</div>
-            <div>Target: Itel A70 (3GB RAM) · WebViewAssetLoader · 0 Deprecated APIs</div>
+            <div>Target: Itel A70 (Android 5+ minSdk 21 → targetSdk 35) · C++17 NDK · 0 Deprecated APIs</div>
+            <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
+              Sync Protocol: {project.syncProtocol?.designTokenHash ?? '0xSYNC'} · Web PWA · Playables · Reels 9:16
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -713,6 +717,24 @@ export const TelemetryExportPanel: React.FC<TelemetryExportPanelProps> = ({
             >
               <Download className="h-3.5 w-3.5" />
               AndroidManifest.xml
+            </button>
+            <button
+              type="button"
+              data-testid="download-cmake-btn"
+              onClick={() => downloadTextFile(apkPack.cmakeListsTxt, 'CMakeLists.txt', 'text/plain')}
+              className="inline-flex h-10 items-center justify-center gap-1.5 rounded-xl border border-slate-300 dark:border-slate-700 px-3 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              <Download className="h-3.5 w-3.5" />
+              CMakeLists.txt (NDK)
+            </button>
+            <button
+              type="button"
+              data-testid="download-native-cpp-btn"
+              onClick={() => downloadTextFile(apkPack.nativeVmCpp, 'qolbu_native_vm.cpp', 'text/x-c++src')}
+              className="inline-flex h-10 items-center justify-center gap-1.5 rounded-xl border border-slate-300 dark:border-slate-700 px-3 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              <Code2 className="h-3.5 w-3.5" />
+              qolbu_native_vm.cpp
             </button>
             <button
               type="button"
@@ -767,16 +789,17 @@ export const TelemetryExportPanel: React.FC<TelemetryExportPanelProps> = ({
                   onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (!file) return;
+                    if (file.size > 2 * 1024 * 1024) {
+                      onShareFeedback('Project JSON exceeds 2 MB safety limit.');
+                      return;
+                    }
                     const reader = new FileReader();
                     reader.onload = () => {
-                      const parsed = safeJsonParse<StudioProjectState | null>(
-                        String(reader.result || ''),
-                        null
-                      );
-                      if (parsed?.brief?.title && parsed?.gdd && parsed?.stateMachine) {
-                        onImportProject(parsed);
+                      const result = validateAndMigrateImportedProjectJson(String(reader.result || ''));
+                      if (result.ok && result.project) {
+                        onImportProject(result.project);
                       } else {
-                        onShareFeedback('Invalid studio project JSON schema.');
+                        onShareFeedback(result.error || 'Invalid studio project JSON schema.');
                       }
                     };
                     reader.readAsText(file);
